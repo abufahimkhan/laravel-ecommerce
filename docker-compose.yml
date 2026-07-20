@@ -1,0 +1,312 @@
+# ============================================
+# Fast Basket - Full Stack Application
+# Production-quality Docker Setup
+# ============================================
+
+services:
+  # ============================================
+  # PostgreSQL Database
+  # ============================================
+  database:
+    image: postgres:16-alpine
+    container_name: fast_basket_db
+    restart: unless-stopped
+
+    environment:
+      POSTGRES_DB: ${DB_DATABASE}
+      POSTGRES_USER: ${DB_USERNAME}
+      POSTGRES_PASSWORD: ${DB_PASSWORD}
+      PGDATA: /var/lib/postgresql/data/pgdata
+
+    ports:
+      - "5432:5432"
+
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./postgres/init:/docker-entrypoint-initdb.d:ro
+
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${DB_USERNAME} -d ${DB_DATABASE}"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+
+    networks:
+      - app-network
+
+  # ============================================
+  # Redis (Cache, Queue, Session)
+  # ============================================
+  redis:
+    image: redis:7-alpine
+    container_name: fast_basket_redis
+    restart: unless-stopped
+
+    command: >
+      redis-server
+      --appendonly yes
+      --maxmemory 256mb
+      --maxmemory-policy allkeys-lru
+
+    ports:
+      - "6379:6379"
+
+    volumes:
+      - redis_data:/data
+
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+    networks:
+      - app-network
+
+  # ============================================
+  # Laravel API
+  # ============================================
+  api:
+    build:
+      context: ./api
+      dockerfile: Dockerfile
+
+    container_name: fast_basket_api
+    restart: unless-stopped
+
+    depends_on:
+      database:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+    working_dir: /var/www/html
+
+    volumes:
+      - ./api:/var/www/html
+      - laravel_storage:/var/www/html/storage
+
+    environment:
+      APP_NAME: ${APP_NAME}
+      APP_ENV: ${APP_ENV}
+      APP_DEBUG: "true"
+      APP_URL: ${APP_URL}
+      APP_KEY: ${APP_KEY}
+
+      # Database
+      DB_CONNECTION: pgsql
+      DB_HOST: database
+      DB_PORT: 5432
+      DB_DATABASE: ${DB_DATABASE}
+      DB_USERNAME: ${DB_USERNAME}
+      DB_PASSWORD: ${DB_PASSWORD}
+
+      # Redis
+      REDIS_CLIENT: predis
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+      REDIS_PASSWORD: null
+
+      # Cache, Queue, Session
+      CACHE_STORE: redis
+      QUEUE_CONNECTION: redis
+      SESSION_DRIVER: redis
+      SESSION_LIFETIME: 120
+
+      # Mail
+      MAIL_MAILER: smtp
+      MAIL_HOST: mailpit
+      MAIL_PORT: 1025
+      MAIL_USERNAME: null
+      MAIL_PASSWORD: null
+      MAIL_ENCRYPTION: null
+      MAIL_FROM_ADDRESS: "noreply@fastbasket.com"
+      MAIL_FROM_NAME: "${APP_NAME}"
+
+      # Logging
+      LOG_CHANNEL: stack
+      LOG_STACK: single
+      LOG_LEVEL: debug
+
+    expose:
+      - "8000"
+
+    command: php artisan serve --host=0.0.0.0 --port=8000
+
+    networks:
+      - app-network
+
+  # ============================================
+  # Laravel Queue Worker
+  # ============================================
+  queue:
+    build:
+      context: ./api
+      dockerfile: Dockerfile
+
+    container_name: fast_basket_queue
+    restart: unless-stopped
+
+    depends_on:
+      - api
+      - redis
+      - database
+
+    working_dir: /var/www/html
+
+    volumes:
+      - ./api:/var/www/html
+      - laravel_storage:/var/www/html/storage
+
+    environment:
+      APP_NAME: ${APP_NAME}
+      APP_ENV: ${APP_ENV}
+      APP_DEBUG: "true"
+      APP_URL: ${APP_URL}
+      APP_KEY: ${APP_KEY}
+
+      DB_CONNECTION: pgsql
+      DB_HOST: database
+      DB_PORT: 5432
+      DB_DATABASE: ${DB_DATABASE}
+      DB_USERNAME: ${DB_USERNAME}
+      DB_PASSWORD: ${DB_PASSWORD}
+
+      REDIS_CLIENT: predis
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+
+      CACHE_STORE: redis
+      QUEUE_CONNECTION: redis
+      SESSION_DRIVER: redis
+
+      MAIL_MAILER: smtp
+      MAIL_HOST: mailpit
+      MAIL_PORT: 1025
+
+    command: php artisan queue:work --verbose --tries=3 --timeout=90
+
+    networks:
+      - app-network
+
+  # ============================================
+  # Next.js Frontend
+  # ============================================
+  web:
+    build:
+      context: ./web
+      dockerfile: Dockerfile
+
+    container_name: fast_basket_web
+    restart: unless-stopped
+
+    working_dir: /app
+
+    volumes:
+      - ./web:/app
+      - /app/node_modules
+      - /app/.next
+
+    environment:
+      NODE_ENV: development
+      NEXT_PUBLIC_API_URL: ${NEXT_PUBLIC_API_URL}
+      NEXT_TELEMETRY_DISABLED: 1
+      WATCHPACK_POLLING: "true"
+      CHOKIDAR_USEPOLLING: "true"
+
+    expose:
+      - "3000"
+
+    command: npm run dev
+
+    networks:
+      - app-network
+
+  # ============================================
+  # Mailpit (Email catcher for dev)
+  # ============================================
+  mailpit:
+    image: axllent/mailpit:latest
+    container_name: fast_basket_mailpit
+    restart: unless-stopped
+
+    ports:
+      - "1025:1025"
+      - "8025:8025"
+
+    environment:
+      MP_MAX_MESSAGES: 5000
+      MP_SMTP_AUTH_ACCEPT_ANY: 1
+      MP_SMTP_AUTH_ALLOW_INSECURE: 1
+
+    networks:
+      - app-network
+
+  # ============================================
+  # pgAdmin (Database GUI)
+  # ============================================
+  pgadmin:
+    image: dpage/pgadmin4:latest
+    container_name: fast_basket_pgadmin
+    restart: unless-stopped
+
+    environment:
+      PGADMIN_DEFAULT_EMAIL: ${PGADMIN_EMAIL}
+      PGADMIN_DEFAULT_PASSWORD: ${PGADMIN_PASSWORD}
+      PGADMIN_LISTEN_PORT: 80
+
+    ports:
+      - "5050:80"
+
+    depends_on:
+      - database
+
+    volumes:
+      - pgadmin_data:/var/lib/pgadmin
+
+    networks:
+      - app-network
+
+  # ============================================
+  # Nginx (Reverse Proxy)
+  # ============================================
+  nginx:
+    image: nginx:alpine
+    container_name: fast_basket_nginx
+    restart: unless-stopped
+
+    depends_on:
+      - api
+      - web
+
+    ports:
+      - "${APP_PORT:-80}:80"
+
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./api/public:/var/www/html/public:ro
+
+    networks:
+      - app-network
+
+# ============================================
+# Named Volumes (persist data across restarts)
+# ============================================
+volumes:
+  postgres_data:
+    driver: local
+  redis_data:
+    driver: local
+  laravel_storage:
+    driver: local
+  pgadmin_data:
+    driver: local
+
+# ============================================
+# Networks
+# ============================================
+networks:
+  app-network:
+    driver: bridge
+    name: fast_basket_network
